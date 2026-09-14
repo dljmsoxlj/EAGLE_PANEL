@@ -6,6 +6,7 @@ import secrets
 import time
 import aiofiles
 import psutil
+import re
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from urllib.parse import quote
@@ -39,7 +40,9 @@ CONFIG = {
 }
 
 ADMIN_USERNAME = "admin"
-ADMIN_PASSWORD = "PERSEPOLIS"
+ADMIN_PASSWORD = "P443"
+DEFAULT_ADMIN_PASSWORD = "P443"  # رمز پیش‌فرض نصب — بعد از تغییر رمز، راهنمای آبی از صفحه لاگین حذف می‌شود
+PANEL_VERSION = "v10.4"  # همگام با پنل کلادفلری
 
 # ─── App ──────────────────────────────────────────────────────────────────────
 app = FastAPI(title="🏛️ Persepolis Gateway v14", docs_url=None, redoc_url=None)
@@ -76,6 +79,7 @@ hourly_traffic_history: dict = defaultdict(lambda: defaultdict(int))
 device_connections: dict = {}
 DEVICE_CONNECTIONS_LOCK = asyncio.Lock()
 http_client: httpx.AsyncClient | None = None
+_tg_sess: dict = {}  # جلسات گفتگوی ربات تلگرام
 
 # ─── Auth ──────────────────────────────────────────────────────────────────────
 SESSION_COOKIE = "persepolis_session"
@@ -330,7 +334,7 @@ async def require_auth(request: Request):
 # ─── State Persistence ──────────────────────────────────────────────────────
 
 async def load_state():
-    global LINKS, SUBS, SETTINGS, hourly_traffic_history, hourly_traffic
+    global LINKS, SUBS, SETTINGS, hourly_traffic_history, hourly_traffic, ADMIN_USERNAME, ADMIN_PASSWORD
     try:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         if DATA_FILE.exists():
@@ -341,6 +345,10 @@ async def load_state():
             SUBS.update(data.get("subs", {}))
             if "settings" in data:
                 SETTINGS.update(data["settings"])
+                if SETTINGS.get("admin_username"):
+                    ADMIN_USERNAME = SETTINGS["admin_username"]
+                if SETTINGS.get("admin_password"):
+                    ADMIN_PASSWORD = SETTINGS["admin_password"]
             if "hourly_traffic" in data:
                 hourly_traffic = defaultdict(int, data["hourly_traffic"])
             if "hourly_traffic_history" in data:
@@ -414,8 +422,12 @@ async def get_language():
 @app.post("/api/settings/theme")
 async def set_theme(request: Request, _=Depends(require_auth)):
     body = await request.json()
-    theme = body.get("theme", "dark")
-    if theme in ["dark", "light"]:
+    theme = body.get("theme", "obsidian")
+    if theme == "light":
+        theme = "white"  # مهاجرت نام قدیم
+    if theme == "dark":
+        theme = "cosmic"  # مهاجرت نام قدیم (مثل UI)
+    if theme in ["obsidian", "cosmic", "bumblebee", "white"]:
         SETTINGS["theme"] = theme
         await save_state()
         return {"ok": True, "theme": theme}
@@ -423,7 +435,12 @@ async def set_theme(request: Request, _=Depends(require_auth)):
 
 @app.get("/api/settings")
 async def get_settings(_=Depends(require_auth)):
-    return SETTINGS
+    s = dict(SETTINGS)
+    tg = s.get("telegram")
+    if tg:
+        s["telegram"] = {k: tg.get(k) for k in ("chat_id", "bot_username", "enabled")}
+    s.pop("admin_password", None)
+    return s
 
 @app.post("/api/settings/rgb")
 async def toggle_rgb(request: Request, _=Depends(require_auth)):
@@ -431,6 +448,360 @@ async def toggle_rgb(request: Request, _=Depends(require_auth)):
     SETTINGS["rgb_mode"] = bool(body.get("enabled", False))
     await save_state()
     return {"rgb_mode": SETTINGS["rgb_mode"]}
+
+# ─── API: پینگ/نسخه (همگام با پنل کلادفلری) ─────────────────────────────────
+@app.get("/api/ping")
+async def api_ping():
+    return {"ok": True, "v": PANEL_VERSION, "t": int(time.time() * 1000)}
+
+
+@app.get("/api/stats")
+async def api_stats_hourly(_=Depends(require_auth)):
+    return {"hourly": dict(hourly_traffic)}
+
+
+# ─── API: تغییر اعتبارنامه ادمین ─────────────────────────────────────────────
+@app.post("/api/settings/credentials")
+async def set_credentials(request: Request, _=Depends(require_auth)):
+    global ADMIN_USERNAME, ADMIN_PASSWORD
+    body = await request.json()
+    username = (body.get("username") or "").strip()
+    new_password = body.get("new_password") or ""
+    current_password = body.get("current_password") or ""
+    if current_password != ADMIN_PASSWORD:
+        raise HTTPException(status_code=400, detail="رمز فعلی اشتباه است")
+    if len(username) < 3:
+        raise HTTPException(status_code=400, detail="نام کاربری حداقل ۳ کاراکتر")
+    if len(new_password) < 6:
+        raise HTTPException(status_code=400, detail="رمز جدید حداقل ۶ کاراکتر")
+    ADMIN_USERNAME = username
+    ADMIN_PASSWORD = new_password
+    SETTINGS["admin_username"] = username
+    SETTINGS["admin_password"] = new_password
+    await save_state()
+    log_activity("auth", "اعتبارنامه ادمین از تنظیمات تغییر کرد", "warn")
+    return {"ok": True}
+
+
+# ─── ربات تلگرام کنترل‌کننده پنل (پورت کامل از ورکر v10.4) ───────────────────
+def _tg_origin() -> str:
+    host = get_host() or ""
+    if not host:
+        return "http://localhost"
+    return host if host.startswith("http") else "https://" + host
+
+
+def _tg_esc(s: str) -> str:
+    return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+async def _tg_api(token: str, method: str, payload: dict, timeout: float = 10.0):
+    client = http_client
+    own = False
+    if client is None:
+        client = httpx.AsyncClient(timeout=timeout)
+        own = True
+    try:
+        r = await client.post(f"https://api.telegram.org/bot{token}/{method}", json=payload, timeout=timeout)
+        return r.json()
+    finally:
+        if own:
+            await client.aclose()
+
+
+async def _tg_send(token, chat_id, text, keyboard=None):
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
+    if keyboard:
+        payload["reply_markup"] = {"inline_keyboard": keyboard}
+    try:
+        return await _tg_api(token, "sendMessage", payload)
+    except Exception:
+        return None
+
+
+def _tg_menu():
+    return [
+        [{"text": "👥 کاربران", "callback_data": "tg:users"}, {"text": "➕ ساخت کاربر", "callback_data": "tg:create"}],
+        [{"text": "🔑 تغییر رمز پنل", "callback_data": "tg:chpass"}, {"text": "📊 وضعیت پنل", "callback_data": "tg:status"}],
+        [{"text": "ℹ️ درباره پنل", "callback_data": "tg:about"}],
+    ]
+
+
+async def _tg_handle(update: dict, origin: str):
+    try:
+        await _tg_handle_inner(update, origin)
+    except Exception as e:
+        logger.warning(f"TG handler error: {e}")
+
+
+async def _tg_handle_inner(update: dict, origin: str):
+    global ADMIN_USERNAME, ADMIN_PASSWORD
+    tg = SETTINGS.get("telegram") or {}
+    if not tg or not tg.get("enabled", True) or not tg.get("token"):
+        return
+    token = tg["token"]
+    allowed = str(tg.get("chat_id", ""))
+    chat_id = text = cb_id = data = from_id = None
+    if update.get("callback_query"):
+        cq = update["callback_query"]
+        chat_id = str(cq["message"]["chat"]["id"])
+        from_id = str(cq["from"]["id"])
+        cb_id = cq.get("id")
+        data = cq.get("data") or ""
+    elif update.get("message", {}).get("text"):
+        msg = update["message"]
+        chat_id = str(msg["chat"]["id"])
+        from_id = str(msg["from"]["id"])
+        text = str(msg.get("text") or "").strip()
+    else:
+        return
+    if from_id != allowed or chat_id != allowed:
+        return
+    if cb_id:
+        try:
+            await _tg_api(token, "answerCallbackQuery", {"callback_query_id": cb_id})
+        except Exception:
+            pass
+    sess = _tg_sess.get(chat_id)
+
+    def finish():
+        _tg_sess.pop(chat_id, None)
+
+    # ── حالت‌های گفتگو ──
+    if sess and text and not text.startswith("/"):
+        if time.time() - (sess.get("ts") or 0) > 600:
+            finish()
+        elif sess["a"] == "create":
+            finish()
+            label = text[:60] or "کاربر"
+            uid = generate_uuid()
+            async with LINKS_LOCK:
+                LINKS[uid] = {"label": label, "limit_bytes": 0, "used_bytes": 0,
+                              "created_at": now_ir().isoformat(), "active": True, "expires_at": None,
+                              "note": "ساخته‌شده از ربات تلگرام", "is_default": False, "sub_id": None,
+                              "protocol": DEFAULT_PROTOCOL, "http_version": "h2", "max_devices": 0,
+                              "fingerprint": "chrome", "password_hash": ""}
+            await save_state()
+            log_activity("link", f"کانفیگ «{label}» از ربات تلگرام ساخته شد", "ok")
+            await _tg_send(token, chat_id, "✅ کاربر <b>" + _tg_esc(label) + "</b> ساخته شد (نامحدود).\n\n📡 لینک ساب:\n<code>" + origin + "/sub/" + uid + "</code>", [[{"text": "👥 کاربران", "callback_data": "tg:users"}]])
+            return
+        elif sess["a"] == "ren":
+            finish()
+            old = None
+            new_label = None
+            async with LINKS_LOCK:
+                link = LINKS.get(sess["uid"])
+                if link:
+                    old = link.get("label")
+                    link["label"] = text[:60] or old
+                    new_label = link["label"]
+            if old is not None:
+                await save_state()
+                log_activity("link", f"کانفیگ «{old}» از ربات به «{new_label}» تغییر نام یافت", "info")
+                await _tg_send(token, chat_id, "✅ نام به <b>" + _tg_esc(new_label) + "</b> تغییر کرد.", _tg_menu())
+            else:
+                await _tg_send(token, chat_id, "❌ کاربر یافت نشد.", _tg_menu())
+            return
+        elif sess["a"] == "chpass":
+            finish()
+            if len(text) < 6:
+                await _tg_send(token, chat_id, "❌ رمز باید حداقل ۶ کاراکتر باشد — از منو دوباره شروع کن.", _tg_menu())
+                return
+            ADMIN_PASSWORD = text
+            SETTINGS["admin_password"] = text
+            if not SETTINGS.get("admin_username"):
+                SETTINGS["admin_username"] = ADMIN_USERNAME
+            await save_state()
+            log_activity("auth", "رمز ادمین از ربات تلگرام تغییر کرد", "warn")
+            await _tg_send(token, chat_id, "🔑 <b>رمز پنل تغییر کرد!</b>\nاز این به بعد ورود فقط با رمز جدید است — رمز را امن نگه دار 💎")
+            return
+
+    # ── دستورات متنی ──
+    if text in ("/start", "/menu"):
+        finish()
+        await _tg_send(token, chat_id, "🤖 <b>ربات کنترل پنل P443</b> " + PANEL_VERSION + "\n\nسلام ادمین 👋 از منوی زیر همه‌چیز را می‌توانی:\n• ساخت / حذف / ویرایش کاربر\n• تغییر رمز پنل\n• وضعیت و نسخه پنل", _tg_menu())
+        return
+    if text == "/cancel":
+        finish()
+        await _tg_send(token, chat_id, "✖️ لغو شد.", _tg_menu())
+        return
+
+    # ── دکمه‌ها ──
+    if data and data.startswith("tg:"):
+        act = data[3:]
+        if act in ("users", "back"):
+            finish()
+            async with LINKS_LOCK:
+                links = sorted(LINKS.items(), key=lambda kv: str(kv[1].get("created_at") or ""), reverse=True)
+            if not links:
+                await _tg_send(token, chat_id, "هنوز کاربری وجود ندارد — با دکمه‌ی «➕ ساخت کاربر» بساز.", _tg_menu())
+                return
+            kb = []
+            for uid, l in links[:15]:
+                st = "⛔" if l.get("active") is False else "✅"
+                kb.append([{"text": st + " " + _tg_esc(l.get("label") or uid[:8]), "callback_data": "tg:view:" + uid}])
+            kb.append([{"text": "➕ ساخت کاربر", "callback_data": "tg:create"}, {"text": "⬅️ منو", "callback_data": "tg:back"}])
+            await _tg_send(token, chat_id, "👥 <b>" + str(len(links)) + " کاربر</b> — روی اسم بزن تا مدیریتش کنی:", kb)
+            return
+        if act.startswith("view:"):
+            uid = act[5:]
+            async with LINKS_LOCK:
+                l = dict(LINKS[uid]) if uid in LINKS else None
+            if not l:
+                await _tg_send(token, chat_id, "❌ کاربر یافت نشد.", _tg_menu())
+                return
+            used = fmt_bytes(l.get("used_bytes") or 0)
+            lim = fmt_bytes(l["limit_bytes"]) if (l.get("limit_bytes") or 0) > 0 else "نامحدود"
+            st = "⛔ غیرفعال" if l.get("active") is False else "✅ فعال"
+            await _tg_send(token, chat_id, "👤 <b>" + _tg_esc(l.get("label") or "") + "</b>\n\nوضعیت: " + st + "\nمصرف: " + used + " از " + lim + "\nساخته‌شده: " + str(l.get("created_at") or "")[:10] + "\n\n📡 ساب:\n<code>" + origin + "/sub/" + uid + "</code>", [
+                [{"text": "✏️ تغییر نام", "callback_data": "tg:ren:" + uid}, {"text": ("▶️ فعال‌سازی" if l.get("active") is False else "⏸ غیرفعال‌سازی"), "callback_data": "tg:tog:" + uid}],
+                [{"text": "📡 ارسال دوباره لینک", "callback_data": "tg:sub:" + uid}, {"text": "🗑 حذف", "callback_data": "tg:delq:" + uid}],
+                [{"text": "⬅️ کاربران", "callback_data": "tg:users"}],
+            ])
+            return
+        if act.startswith("ren:"):
+            uid = act[4:]
+            async with LINKS_LOCK:
+                exists = uid in LINKS
+            if exists:
+                _tg_sess[chat_id] = {"a": "ren", "uid": uid, "ts": time.time()}
+                await _tg_send(token, chat_id, "✏️ اسم جدید کاربر را بفرست:")
+            return
+        if act.startswith("tog:"):
+            uid = act[4:]
+            label_now = None
+            active_now = None
+            async with LINKS_LOCK:
+                l = LINKS.get(uid)
+                if l:
+                    l["active"] = (l.get("active") is False)
+                    label_now = l.get("label")
+                    active_now = l["active"]
+            if label_now is not None:
+                await save_state()
+                log_activity("link", f"کانفیگ «{label_now}» از ربات {'فعال' if active_now else 'غیرفعال'} شد", "info")
+                await _tg_send(token, chat_id, "✅ «" + _tg_esc(label_now) + "» " + ("فعال" if active_now else "غیرفعال") + " شد.", _tg_menu())
+            return
+        if act.startswith("sub:"):
+            uid = act[4:]
+            async with LINKS_LOCK:
+                l = LINKS.get(uid)
+                lbl = l.get("label") if l else None
+            if l:
+                await _tg_send(token, chat_id, "📡 ساب «" + _tg_esc(lbl) + "»:\n<code>" + origin + "/sub/" + uid + "</code>")
+            return
+        if act.startswith("delq:"):
+            uid = act[5:]
+            async with LINKS_LOCK:
+                l = LINKS.get(uid)
+                lbl = l.get("label") if l else None
+            if l:
+                await _tg_send(token, chat_id, "⚠️ «" + _tg_esc(lbl) + "» برای همیشه حذف شود؟", [[{"text": "🗑 بله، حذف قطعی", "callback_data": "tg:dely:" + uid}, {"text": "✖️ انصراف", "callback_data": "tg:back"}]])
+            return
+        if act.startswith("dely:"):
+            uid = act[5:]
+            async with LINKS_LOCK:
+                l = LINKS.pop(uid, None)
+                if l:
+                    sid = l.get("sub_id")
+                    if sid and sid in SUBS:
+                        ids = SUBS[sid].get("link_ids") or []
+                        if uid in ids:
+                            ids.remove(uid)
+            if l:
+                await save_state()
+                log_activity("link", f"کانفیگ «{l.get('label')}» از ربات تلگرام حذف شد", "err")
+                await _tg_send(token, chat_id, "🗑 «" + _tg_esc(l.get("label")) + "» حذف شد.", _tg_menu())
+            return
+        if act == "create":
+            _tg_sess[chat_id] = {"a": "create", "ts": time.time()}
+            await _tg_send(token, chat_id, "➕ اسم کاربر جدید را بفرست:\n(نامحدود ساخته می‌شود — محدودکردن از پنل)")
+            return
+        if act == "chpass":
+            _tg_sess[chat_id] = {"a": "chpass", "ts": time.time()}
+            await _tg_send(token, chat_id, "🔑 رمز جدید پنل را بفرست (حداقل ۶ کاراکتر):\n\n⚠️ بعد از تغییر، ورود پنل فقط با رمز جدید است.")
+            return
+        if act == "status":
+            async with LINKS_LOCK:
+                links = list(LINKS.values())
+            active = sum(1 for l in links if l.get("active") is not False)
+            today = sum(hourly_traffic.values())
+            await _tg_send(token, chat_id, "📊 <b>وضعیت پنل P443</b>\n\n👥 کاربران: " + str(len(links)) + " (" + str(active) + " فعال)\n📊 مصرف امروز: " + fmt_bytes(today) + "\n📈 ترافیک کل: " + fmt_bytes(stats["total_bytes"]) + "\n🔗 اتصالات زنده: " + str(len(connections)) + "\n⏱ آپ‌تایم: " + uptime() + "\n💎 نسخه پنل: <b>" + PANEL_VERSION + "</b>", _tg_menu())
+            return
+        if act == "about":
+            await _tg_send(token, chat_id, "💎 <b>P443 Panel " + PANEL_VERSION + "</b>\nPersepolis VLESS-WS Panel\n\n🤖 این ربات فقط برای ادمین پنل کار می‌کند.\n🚫 فروش پنل یا کانفیگ‌ها ممنوع است — نشانه‌ی شخصیت و شرف توست 🙏", _tg_menu())
+            return
+
+
+@app.post("/api/settings/telegram")
+async def set_telegram(request: Request, _=Depends(require_auth)):
+    body = await request.json()
+    token = str(body.get("token") or "").strip()
+    chat_id = str(body.get("chat_id") or "").strip()
+    if not re.fullmatch(r"\d{6,}:[A-Za-z0-9_-]{20,}", token):
+        raise HTTPException(status_code=400, detail="فرمت توکن ربات اشتباه است (مثل 123456:ABC-DEF...)")
+    if not re.fullmatch(r"\d{3,}", chat_id):
+        raise HTTPException(status_code=400, detail="آیدی عددی تلگرام نامعتبر است (فقط رقم — از @userinfobot بگیر)")
+    try:
+        me = await _tg_api(token, "getMe", {})
+        if not me or not me.get("ok"):
+            raise HTTPException(status_code=400, detail="توکن ربات نامعتبر است — از @BotFather دوباره چک کن")
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=502, detail="اتصال به تلگرام ناموفق بود — دوباره امتحان کن")
+    secret = secrets.token_hex(12)
+    SETTINGS["telegram"] = {"token": token, "chat_id": chat_id, "secret": secret,
+                            "bot_username": (me.get("result") or {}).get("username", ""), "enabled": True}
+    await save_state()
+    hook = False
+    try:
+        j2 = await _tg_api(token, "setWebhook", {"url": _tg_origin() + "/tg-webhook/" + secret,
+                                                 "allowed_updates": ["message", "callback_query"],
+                                                 "drop_pending_updates": True})
+        hook = bool(j2 and j2.get("ok"))
+    except Exception:
+        pass
+    log_activity("auth", "ربات تلگرام @" + str((me.get("result") or {}).get("username") or "?") + " به پنل متصل شد", "ok")
+    return {"ok": True, "bot_username": (me.get("result") or {}).get("username", ""), "webhook_set": hook, "chat_id": chat_id, "saved": True}
+
+
+@app.post("/api/settings/telegram/disable")
+async def disable_telegram(_=Depends(require_auth)):
+    tg = SETTINGS.get("telegram") or {}
+    if tg.get("token"):
+        try:
+            await _tg_api(tg["token"], "deleteWebhook", {}, timeout=8.0)
+        except Exception:
+            pass
+    SETTINGS.pop("telegram", None)
+    await save_state()
+    log_activity("auth", "ربات تلگرام از پنل قطع شد", "warn")
+    return {"ok": True}
+
+
+@app.get("/api/settings/telegram")
+async def get_telegram(_=Depends(require_auth)):
+    tg = SETTINGS.get("telegram")
+    if not tg:
+        return {"configured": False}
+    return {"configured": True, "enabled": bool(tg.get("enabled")), "chat_id": tg.get("chat_id"),
+            "bot_username": tg.get("bot_username", ""),
+            "token_masked": str(tg.get("token", "")).split(":")[0] + ":..."}
+
+
+@app.post("/tg-webhook/{secret}")
+async def tg_webhook(secret: str, request: Request):
+    tg = SETTINGS.get("telegram") or {}
+    if not tg or not tg.get("secret") or tg["secret"] != secret:
+        return JSONResponse({"detail": "forbidden"}, status_code=403)
+    try:
+        update = await request.json()
+    except Exception:
+        return JSONResponse({"detail": "bad request"}, status_code=400)
+    asyncio.create_task(_tg_handle(update, _tg_origin()))
+    return JSONResponse({"ok": True})
+
 
 # ─── API: Dashboard Stats ──────────────────────────────────────────────────
 
@@ -445,6 +816,7 @@ async def dashboard_stats(_=Depends(require_auth)):
         speed = 0
     
     return {
+        "version": PANEL_VERSION,
         "traffic": {
             "total": stats["total_bytes"],
             "total_fmt": fmt_bytes(stats["total_bytes"]),
@@ -791,10 +1163,17 @@ async def get_connections(_=Depends(require_auth)):
         })
     result.sort(key=lambda x: x.get("last_connected_at") or "", reverse=True)
 
+    by_uuid: dict = {}
+    for c in connections.values():
+        u = c.get("uuid")
+        if u:
+            by_uuid[u] = by_uuid.get(u, 0) + 1
+
     return {
         "connections": result,
         "count": len(result),
         "raw_count": len(connections),
+        "by_uuid": by_uuid,
     }
 
 # ─── Auth Endpoints ────────────────────────────────────────────────────────
@@ -828,6 +1207,10 @@ async def api_logout(request: Request):
 
 @app.get("/api/me")
 async def api_me(request: Request):
+    return {"authenticated": await is_valid_session(request.cookies.get(SESSION_COOKIE))}
+
+@app.head("/api/me")
+async def api_me_head(request: Request):
     return {"authenticated": await is_valid_session(request.cookies.get(SESSION_COOKIE))}
 
 # ─── API: Activity Logs ───────────────────────────────────────────────────────
@@ -1158,62 +1541,13 @@ async def subscription_single(request: Request, uuid: str):
     
     if not link:
         if is_browser:
-            return HTMLResponse("""
-            <!DOCTYPE html>
-            <html lang="fa" dir="rtl">
-            <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <title>🏛️ کاربر یافت نشد</title>
-            <link rel="preconnect" href="https://fonts.googleapis.com">
-            <link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;700;800&display=swap" rel="stylesheet">
-            <style>
-            *{margin:0;padding:0;box-sizing:border-box}
-            body{font-family:'Vazirmatn',sans-serif;background:#0a0a1a;min-height:100vh;display:flex;align-items:center;justify-content:center;color:#F5ECD7}
-            .card{background:rgba(10,10,30,0.85);backdrop-filter:blur(30px);border:1px solid rgba(212,175,55,0.12);border-radius:28px;padding:40px;max-width:420px;text-align:center}
-            .icon{font-size:64px;margin-bottom:16px}
-            h2{font-size:22px;font-weight:800;margin-bottom:8px}
-            p{color:#8A7A4A;font-size:13px;line-height:1.8}
-            </style>
-            </head>
-            <body>
-            <div class="card">
-                <div class="icon">🏛️</div>
-                <h2>کاربر یافت نشد</h2>
-                <p>لینک ساب‌لینک معتبر نیست یا کاربر حذف شده است.</p>
-            </div>
-            </body>
-            </html>
-            """, status_code=404)
+            return HTMLResponse(content=not_found_page("لینک ساب‌لینک معتبر نیست یا کاربر حذف شده است."), status_code=404)
         else:
             raise HTTPException(status_code=404, detail="user not found")
     
     if not is_link_allowed(link):
         if is_browser:
-            return HTMLResponse("""
-            <!DOCTYPE html>
-            <html lang="fa" dir="rtl">
-            <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <title>⛔ کاربر غیرفعال</title>
-            <link rel="preconnect" href="https://fonts.googleapis.com">
-            <link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;700;800&display=swap" rel="stylesheet">
-            <style>
-            *{margin:0;padding:0;box-sizing:border-box}
-            body{font-family:'Vazirmatn',sans-serif;background:#0a0a1a;min-height:100vh;display:flex;align-items:center;justify-content:center;color:#F5ECD7}
-            .card{background:rgba(10,10,30,0.85);backdrop-filter:blur(30px);border:1px solid rgba(239,68,68,0.12);border-radius:28px;padding:40px;max-width:420px;text-align:center}
-            .icon{font-size:64px;margin-bottom:16px}
-            h2{font-size:22px;font-weight:800;margin-bottom:8px}
-            p{color:#8A7A4A;font-size:13px;line-height:1.8}
-            .status{color:#F87171}
-            </style>
-            </head>
-            <body>
-            <div class="card">
-                <div class="icon">⛔</div>
-                <h2>کاربر غیرفعال یا منقضی</h2>
-                <p class="status">این کانفیگ فعال نیست یا تاریخ انقضای آن گذشته است.</p>
-            </div>
-            </body>
-            </html>
-            """, status_code=403)
+            return HTMLResponse(content=disabled_page("این کانفیگ فعال نیست یا تاریخ انقضای آن گذشته است."), status_code=403)
         else:
             raise HTTPException(status_code=403, detail="user disabled or expired")
     
@@ -1420,59 +1754,10 @@ async def info_page(uuid: str, request: Request):
         link = LINKS.get(uuid)
     
     if not link:
-        return HTMLResponse("""
-        <!DOCTYPE html>
-        <html lang="fa" dir="rtl">
-        <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>🏛️ کاربر یافت نشد</title>
-        <link rel="preconnect" href="https://fonts.googleapis.com">
-        <link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;700;800&display=swap" rel="stylesheet">
-        <style>
-        *{margin:0;padding:0;box-sizing:border-box}
-        body{font-family:'Vazirmatn',sans-serif;background:#0a0a1a;min-height:100vh;display:flex;align-items:center;justify-content:center;color:#F5ECD7}
-        .card{background:rgba(10,10,30,0.85);backdrop-filter:blur(30px);border:1px solid rgba(212,175,55,0.12);border-radius:28px;padding:40px;max-width:420px;text-align:center}
-        .icon{font-size:64px;margin-bottom:16px}
-        h2{font-size:22px;font-weight:800;margin-bottom:8px}
-        p{color:#8A7A4A;font-size:13px;line-height:1.8}
-        </style>
-        </head>
-        <body>
-        <div class="card">
-            <div class="icon">🏛️</div>
-            <h2>کاربر یافت نشد</h2>
-            <p>لینک اطلاعات معتبر نیست یا کاربر حذف شده است.</p>
-        </div>
-        </body>
-        </html>
-        """, status_code=404)
+        return HTMLResponse(content=not_found_page("لینک اطلاعات معتبر نیست یا کاربر حذف شده است."), status_code=404)
     
     if not is_link_allowed(link):
-        return HTMLResponse("""
-        <!DOCTYPE html>
-        <html lang="fa" dir="rtl">
-        <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>⛔ کاربر غیرفعال</title>
-        <link rel="preconnect" href="https://fonts.googleapis.com">
-        <link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;700;800&display=swap" rel="stylesheet">
-        <style>
-        *{margin:0;padding:0;box-sizing:border-box}
-        body{font-family:'Vazirmatn',sans-serif;background:#0a0a1a;min-height:100vh;display:flex;align-items:center;justify-content:center;color:#F5ECD7}
-        .card{background:rgba(10,10,30,0.85);backdrop-filter:blur(30px);border:1px solid rgba(239,68,68,0.12);border-radius:28px;padding:40px;max-width:420px;text-align:center}
-        .icon{font-size:64px;margin-bottom:16px}
-        h2{font-size:22px;font-weight:800;margin-bottom:8px}
-        p{color:#8A7A4A;font-size:13px;line-height:1.8}
-        .status{color:#F87171}
-        </style>
-        </head>
-        <body>
-        <div class="card">
-            <div class="icon">⛔</div>
-            <h2>کاربر غیرفعال یا منقضی</h2>
-            <p class="status">این کانفیگ فعال نیست یا تاریخ انقضای آن گذشته است.</p>
-        </div>
-        </body>
-        </html>
-        """, status_code=403)
+        return HTMLResponse(content=disabled_page("این کانفیگ فعال نیست یا تاریخ انقضای آن گذشته است."), status_code=403)
     
     host = get_host()
     label = link.get("label", "کاربر")
@@ -1588,13 +1873,17 @@ async def info_page(uuid: str, request: Request):
 
 # ─── HTML Pages ─────────────────────────────────────────────────────────────
 
-from pages import LOGIN_HTML, DASHBOARD_HTML
+from pages import LOGIN_HTML, DASHBOARD_HTML, ROOT_HTML, get_sub_page_html, not_found_page, disabled_page
+
+LOGIN_DEFAULT_HINT_HTML = '<div class="default-pass-hint" dir="rtl">رمز پیش‌فرض: <span class="key">P443</span></div>'
 
 @app.get("/login", response_class=HTMLResponse)
 async def login_page(request: Request):
     if await is_valid_session(request.cookies.get(SESSION_COOKIE)):
         return RedirectResponse(url="/dashboard")
-    return HTMLResponse(content=LOGIN_HTML)
+    # راهنمای آبی فقط تا وقتی رمز همان پیش‌فرض P443 است (بعد از تغییر رمز خودکار مخفی می‌شود)
+    hint = LOGIN_DEFAULT_HINT_HTML if ADMIN_PASSWORD == DEFAULT_ADMIN_PASSWORD else ""
+    return HTMLResponse(content=LOGIN_HTML.replace("⟦default_pass_hint⟧", hint))
 
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard(request: Request):
@@ -1604,28 +1893,7 @@ async def dashboard(request: Request):
 
 @app.get("/", response_class=HTMLResponse)
 async def root():
-    return HTMLResponse("""
-    <!DOCTYPE html>
-    <html>
-    <head><meta charset="UTF-8"><title>🏛️ Persepolis Gateway v14</title>
-    <style>
-    body{font-family:sans-serif;background:#0a0a1a;color:#F5ECD7;display:flex;align-items:center;justify-content:center;height:100vh;margin:0}
-    .card{text-align:center;padding:40px;background:rgba(20,15,10,0.7);border-radius:20px;border:1px solid rgba(212,175,55,0.2)}
-    h1{font-size:48px;margin:0}
-    .sub{color:#8A7A4A}
-    a{color:#D4A843;text-decoration:none;font-weight:bold}
-    </style>
-    </head>
-    <body>
-    <div class="card">
-        <h1>🏛️</h1>
-        <h2>Persepolis Gateway v14</h2>
-        <p class="sub">پنل مدیریت فیلترشکن</p>
-        <a href="/login">ورود به پنل →</a>
-    </div>
-    </body>
-    </html>
-    """)
+    return HTMLResponse(content=ROOT_HTML)
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=CONFIG["port"], log_level="info", workers=1)
